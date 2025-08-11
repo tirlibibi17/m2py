@@ -216,10 +216,29 @@ def convert_m_to_python(m_code: str, query_name: str | None = None) -> str:
             add(f"{lhs} = pd.read_excel('workbook.xlsx', sheet_name=None)['{tbl}']")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
-        m = re.search(r'Csv\.Document\(File\.Contents\("([^"]+)"\)\)', rhs)
+        m = re.search(r'Csv\.Document\(File\.Contents\("([^"]+)"\)\s*(?:,\s*\[([^\]]*)\])?\)', rhs)
         if m:
             csv = m.group(1)
-            add(f"{lhs} = pd.read_csv('{csv}', header=None)")
+            opts = m.group(2) or ""
+            sep = None
+            enc = None
+            quote_none = False
+            m_delim = re.search(r'Delimiter\s*=\s*"([^"]+)"', opts)
+            if m_delim: sep = m_delim.group(1)
+            m_enc = re.search(r'Encoding\s*=\s*(\d+)', opts)
+            if m_enc:
+                codepage = m_enc.group(1)
+                enc = "utf-8" if codepage == "65001" else ("cp1252" if codepage == "1252" else None)
+            if re.search(r'QuoteStyle\s*=\s*QuoteStyle\.None', opts):
+                quote_none = True
+            args = [f"'{csv}'", "header=None"]
+            if sep is not None:
+                args.append(f"sep='{sep}'")
+            if enc is not None:
+                args.append(f"encoding='{enc}'")
+            if quote_none:
+                args.append("quoting=3")  # csv.QUOTE_NONE
+            add(f"{lhs} = pd.read_csv({', '.join(args)})")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
         m = re.search(r'Table\.PromoteHeaders\(([^)]+)\)', rhs)
@@ -293,17 +312,27 @@ def convert_m_to_python(m_code: str, query_name: str | None = None) -> str:
             add(f"{lhs}['{new_col}'] = {expr_py}")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
-        # --- TransformColumnTypes (comment) ---------------------------------
+                # --- TransformColumnTypes -----------------------------------------
         m = re.search(r'Table\.TransformColumnTypes\(([^,]+),\s*\{\{(.+?)\}\}\)', rhs)
         if m:
             src = _normalize_var(m.group(1).strip())
-            col_specs = [s.strip() for s in m.group(2).split("},")]
+            specs = m.group(2)
             add(f"{lhs} = {src}.copy()")
-            for spec in col_specs:
-                cols = re.findall(r'"([^"]+)"', spec)
-                if cols:
-                    c = cols[0]
-                    add(f"# {lhs}['{c}'] = {lhs}['{c}'].astype(...)  # adjust dtype")
+            pairs = re.findall(r'\{\s*\"([^\"]+)\"\s*,\s*type\s*([A-Za-z0-9_\.]+)\s*\}', specs)
+            for col, typ in pairs:
+                t = typ.split('.')[-1].lower()
+                if t in ('text',):
+                    add(f"{lhs}['{col}'] = {lhs}['{col}'].astype('string')")
+                elif t in ('number','double','single','decimal'):
+                    add(f"{lhs}['{col}'] = {lhs}['{col}'].astype('float')")
+                elif t in ('int64','int32','int16','int8'):
+                    add(f"{lhs}['{col}'] = pd.to_numeric({lhs}['{col}'], errors='coerce').astype('Int64')")
+                elif t in ('date','datetime','datetimezone'):
+                    add(f"{lhs}['{col}'] = pd.to_datetime({lhs}['{col}'], errors='coerce')")
+                elif t in ('logical',):
+                    add(f"{lhs}['{col}'] = {lhs}['{col}'].astype('boolean')")
+                else:
+                    add(f"# {lhs}['{col}'] = {lhs}['{col}'].astype('object')  # unhandled type: {t}")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
         # --- Group -----------------------------------------------------------
@@ -329,14 +358,22 @@ def convert_m_to_python(m_code: str, query_name: str | None = None) -> str:
             last_df = lhs
             continue
 
-        # --- Join ------------------------------------------------------------
-        m = re.search(r'Table\.Join\(([^,]+),\s*"([^"]+)",\s*([^,]+),\s*"([^"]+)",\s*JoinKind\.(\w+)\)', rhs)
+                # --- Join (single or multi-key) ----------------------------------
+        m = re.search(r'Table\.Join\(\s*([^,]+),\s*("[^"]+"|\{[^\}]+\})\s*,\s*([^,]+),\s*("[^"]+"|\{[^\}]+\})\s*,\s*JoinKind\.(\w+)\s*\)', rhs)
         if m:
-            left = _normalize_var(m.group(1).strip()); left_key = m.group(2)
-            right = _normalize_var(m.group(3).strip()); right_key = m.group(4)
+            left = _normalize_var(m.group(1).strip())
+            left_keys_raw = m.group(2).strip()
+            right = _normalize_var(m.group(3).strip())
+            right_keys_raw = m.group(4).strip()
             kind = m.group(5)
-            how = {"Inner": "inner", "LeftOuter": "left", "RightOuter": "right", "FullOuter": "outer"}.get(kind, "inner")
-            add(f"{lhs} = pd.merge({left}, {right}, left_on='{left_key}', right_on='{right_key}', how='{how}')")
+            def _parse_keys(k):
+                if k.startswith('{'):
+                    return [x for x in re.findall(r'"([^"]+)"', k)]
+                return [k.strip('"')]
+            lk = _parse_keys(left_keys_raw)
+            rk = _parse_keys(right_keys_raw)
+            how = {'Inner':'inner','LeftOuter':'left','RightOuter':'right','FullOuter':'outer'}.get(kind, 'inner')
+            add(f"{lhs} = pd.merge({left}, {right}, how='{how}', left_on={lk!r}, right_on={rk!r})")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
         # --- Distinct --------------------------------------------------------
@@ -386,16 +423,13 @@ def convert_m_to_python(m_code: str, query_name: str | None = None) -> str:
             add(f"{lhs}.columns = [c if not isinstance(c, tuple) else c[-1] for c in {lhs}.columns]")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
-        
-        # --- ExpandRecordColumn ----------------------------------------------
+                # --- ExpandRecordColumn --------------------------------------
         m = re.search(r'Table\.ExpandRecordColumn\(\s*([^,]+),\s*"([^"]+)"\s*,\s*\{([^\}]*)\}\s*,\s*\{([^\}]*)\}\s*\)', rhs)
         if m:
             src = _normalize_var(m.group(1).strip())
             col = m.group(2)
-            fields_raw = m.group(3)
-            newnames_raw = m.group(4)
-            fields = [s for s in re.findall(r'"([^"]+)"', fields_raw)]
-            newnames = [s for s in re.findall(r'"([^"]+)"', newnames_raw)]
+            fields = [s for s in re.findall(r'"([^"]+)"', m.group(3))]
+            newnames = [s for s in re.findall(r'"([^"]+)"', m.group(4))]
             if not newnames or len(newnames) != len(fields):
                 newnames = fields[:]
             add(f"{lhs} = {src}.drop(columns=['{col}'], errors='ignore').copy()")
@@ -407,15 +441,13 @@ def convert_m_to_python(m_code: str, query_name: str | None = None) -> str:
             add(f"{lhs} = {lhs}.join(_exp)")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
-        # --- ExpandTableColumn -----------------------------------------------
+        # --- ExpandTableColumn ---------------------------------------
         m = re.search(r'Table\.ExpandTableColumn\(\s*([^,]+),\s*"([^"]+)"\s*,\s*\{([^\}]*)\}\s*,\s*\{([^\}]*)\}\s*\)', rhs)
         if m:
             src = _normalize_var(m.group(1).strip())
             col = m.group(2)
-            fields_raw = m.group(3)
-            newnames_raw = m.group(4)
-            fields = [s for s in re.findall(r'"([^"]+)"', fields_raw)]
-            newnames = [s for s in re.findall(r'"([^"]+)"', newnames_raw)]
+            fields = [s for s in re.findall(r'"([^"]+)"', m.group(3))]
+            newnames = [s for s in re.findall(r'"([^"]+)"', m.group(4))]
             if not newnames or len(newnames) != len(fields):
                 newnames = fields[:]
             add(f"{lhs} = {src}.copy()")
