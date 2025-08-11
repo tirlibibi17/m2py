@@ -437,6 +437,46 @@ def convert_m_to_python(m_code: str, query_name: str = "Result") -> str:
             last_df = lhs
             continue
 
+        # --- Table.SelectRows ------------------------------------------------
+        # Table.SelectRows(Source, each [B] = "X" and [A] >= 2)
+        m = re.search(r'Table\.SelectRows\(\s*([^,]+)\s*,\s*each\s+(.+)\)\s*$', rhs, flags=re.S)
+        if m:
+            src = _normalize_var(m.group(1).strip())
+            cond = m.group(2).strip()
+
+            # Replace [Col] -> src['Col']
+            cond = re.sub(r'\[([^\]]+)\]', lambda mm: f"{src}['{mm.group(1)}']", cond)
+
+            # Operators / keywords
+            cond = re.sub(r'<>', '!=', cond)
+            cond = re.sub(r'(?<![<>=!])=(?!=)', '==', cond)  # bare '=' -> '=='
+            cond = re.sub(r'\band\b', '&', cond, flags=re.I)
+            cond = re.sub(r'\bor\b', '|', cond, flags=re.I)
+            cond = re.sub(r'\bnot\b', '~', cond, flags=re.I)
+
+            # Literals
+            cond = re.sub(r'\bnull\b', 'None', cond, flags=re.I)
+            cond = re.sub(r'\btrue\b', 'True', cond, flags=re.I)
+            cond = re.sub(r'\bfalse\b', 'False', cond, flags=re.I)
+
+            add(f"{lhs} = {src}[{cond}].copy()")
+            env[lhs_raw] = lhs; last_df = lhs; continue
+
+        # --- Table.Sort ------------------------------------------------------
+        # Table.Sort(Filtered, {{"A", Order.Descending}, {"B", Order.Ascending}})
+        m = re.search(r'Table\.Sort\(\s*([^,]+)\s*,\s*\{(.+)\}\s*\)\s*$', rhs, flags=re.S)
+        if m:
+            src = _normalize_var(m.group(1).strip())
+            spec = m.group(2)
+            pairs = re.findall(r'\{\s*"([^"]+)"\s*,\s*Order\.(Ascending|Descending)\s*\}', spec)
+            cols = [c for c, _ in pairs] if pairs else []
+            asc = [True if order == 'Ascending' else False for _, order in pairs] if pairs else True
+            if cols:
+                add(f"{lhs} = {src}.sort_values(by={cols!r}, ascending={asc!r}).reset_index(drop=True)")
+            else:
+                add(f"{lhs} = {src}.copy()")
+            env[lhs_raw] = lhs; last_df = lhs; continue
+
         # --- Fallback --------------------------------------------------------
         unsupported(lhs_raw, rhs)
 
