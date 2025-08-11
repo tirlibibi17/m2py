@@ -9,121 +9,16 @@ import pathlib
 import streamlit as st
 from m2py_core import convert_m_to_python
 
-# --------- inline dependency resolver (same as CLI) ---------
 
-def _strip_line_comments(m_code: str) -> str:
-    cleaned_lines = []
-    for line in (m_code or "").splitlines():
-        s = line
-        out, i, in_str, quote = [], 0, False, ""
-        while i < len(s):
-            ch = s[i]
-            if not in_str and ch in ('"', "'"):
-                in_str, quote = True, ch
-                out.append(ch); i += 1; continue
-            if in_str:
-                out.append(ch)
-                if ch == quote:
-                    in_str, quote = False, ""
-                i += 1; continue
-            if ch == "/" and i + 1 < len(s) and s[i + 1] == "/":
-                break
-            out.append(ch); i += 1
-        cleaned_lines.append("".join(out))
-    return "\n".join(cleaned_lines)
+# Import dependency resolver (deduplicated)
+from query_resolver import find_query_refs, topo_order_queries, dependency_chain_for
 
-REF_QUOTED = re.compile(r'#"(.*?)"')
-IDENT = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
-M_KEYWORDS = {"let","in","each","and","or","not","true","false","null","as","if","then","else","error","try","otherwise"}
-
-def find_query_refs(m_code: str, known_names: set[str]) -> set[str]:
-    src = _strip_line_comments(m_code or "")
-    refs = set(re.findall(r'#"(.*?)"', src))
-    cand = set(IDENT.findall(src))
-    refs |= {n for n in cand if n in known_names and n.lower() not in M_KEYWORDS}
-    return refs
-
-def topo_order_queries(queries: dict[str,str]) -> list[str]:
-    known = set(queries.keys())
-    graph = {name: {r for r in find_query_refs(m, known) if r in known and r != name}
-             for name, m in queries.items()}
-    indeg = {n: 0 for n in queries}
-    for n, deps in graph.items():
-        for _ in deps: indeg[n] += 1
-    from collections import deque
-    q = deque([n for n,d in indeg.items() if d==0])
-    order = []
-    while q:
-        u = q.popleft()
-        order.append(u)
-        for v,deps in graph.items():
-            if u in deps:
-                indeg[v] -= 1
-                if indeg[v]==0 and v not in order and v not in q:
-                    q.append(v)
-    remaining = [n for n in queries if n not in order]
-    return order + remaining
-
-def dependency_chain_for(target: str, queries: dict[str,str]) -> list[str]:
-    order = topo_order_queries(queries)
-    known = set(queries.keys())
-    from collections import defaultdict
-    rev = defaultdict(set)
-    for n,m in queries.items():
-        for r in find_query_refs(m, known):
-            if r in known and r != n: rev[n].add(r)
-    seen = set(); stack=[target]
-    while stack:
-        cur = stack.pop()
-        if cur in seen: continue
-        seen.add(cur); stack.extend(rev[cur])
-    return [n for n in order if n in seen]
-
-# --------- inline Excel COM extractor ---------
-
-def extract_queries_from_excel_via_com(path_xlsx: str) -> dict[str,str]:
-    try:
-        import gc, pythoncom
-        import win32com.client as win32
-        from contextlib import contextmanager
-    except Exception:
-        raise RuntimeError("Requires Windows + Excel + 'pywin32'. Install: pip install pywin32")
-
-    @contextmanager
-    def _com_apartment():
-        pythoncom.CoInitialize()
-        try:
-            yield
-        finally:
-            pythoncom.CoUninitialize()
-
-    path_xlsx = str(pathlib.Path(path_xlsx).resolve())
-
-    with _com_apartment():
-        excel = win32.DispatchEx("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        wb = None
-        try:
-            wb = excel.Workbooks.Open(path_xlsx, ReadOnly=True, UpdateLinks=0)
-            result = {}
-            for q in wb.Queries:
-                result[str(q.Name)] = str(q.Formula)
-            return result
-        finally:
-            try:
-                if wb is not None: wb.Close(False)
-            except Exception: pass
-            try:
-                excel.Quit()
-            except Exception: pass
-            del wb; del excel; gc.collect()
-
-# --------- UI ---------
-
-st.set_page_config(page_title="M → pandas Converter", layout="wide")
-st.title("Power Query (M) → pandas Converter")
-
+# Excel COM extractor (Windows-only) — lazy import with fallback
+try:
+    from excel_com_extractor import extract_queries_from_excel_via_com  # noqa: F401
+except Exception:  # pragma: no cover
+    def extract_queries_from_excel_via_com(*args, **kwargs):  # type: ignore
+        raise SystemExit("Excel COM extraction requires Windows + Excel + pywin32.")
 tab1, tab2 = st.tabs(["🔤 Paste M", "📗 Excel (Windows/COM)"])
 
 # --- Paste M ---
