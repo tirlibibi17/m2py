@@ -477,6 +477,78 @@ def convert_m_to_python(m_code: str, query_name: str = "Result") -> str:
                 add(f"{lhs} = {src}.copy()")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
+        # --- Table.Group -----------------------------------------------------
+        # Table.Group(Source, {"A"}, {{"Sum", each List.Sum([Val]), type number}, {"Count", each Table.RowCount(_), Int64.Type}})
+        m = re.search(r'Table\.Group\(\s*([^,]+)\s*,\s*\{([^\}]*)\}\s*,\s*\{(.+)\}\s*\)\s*$', rhs, flags=re.S)
+        if m:
+            src = _normalize_var(m.group(1).strip())
+            keys = re.findall(r'"([^"]+)"', m.group(2))
+            spec = m.group(3)
+
+            # Parse aggregations: {"New", each <expr>, ...}
+            aggs = []
+            for nm, expr in re.findall(r'\{\s*"([^"]+)"\s*,\s*each\s+(.+?)\s*(?:,\s*[^}]*)?\}', spec, flags=re.S):
+                expr = expr.strip()
+                # List.* over [Col]
+                m_sum = re.match(r'List\.Sum\(\s*\[([^\]]+)\]\s*\)', expr)
+                m_avg = re.match(r'List\.Average\(\s*\[([^\]]+)\]\s*\)', expr)
+                m_min = re.match(r'List\.Min\(\s*\[([^\]]+)\]\s*\)', expr)
+                m_max = re.match(r'List\.Max\(\s*\[([^\]]+)\]\s*\)', expr)
+                m_cnt = re.match(r'Table\.RowCount\(\s*_\s*\)', expr)
+                if m_sum:
+                    aggs.append(("named", nm, m_sum.group(1), "sum"))
+                elif m_avg:
+                    aggs.append(("named", nm, m_avg.group(1), "mean"))
+                elif m_min:
+                    aggs.append(("named", nm, m_min.group(1), "min"))
+                elif m_max:
+                    aggs.append(("named", nm, m_max.group(1), "max"))
+                elif m_cnt:
+                    aggs.append(("size", nm))
+                else:
+                    aggs.append(("raw", nm, expr))  # fallback/unknown
+
+            # Build pandas operations (safe unpacking)
+            _named, _sizes, _raw = {}, [], []
+            for a in aggs:
+                if not a:
+                    continue
+                kind = a[0]
+                if kind == "named" and len(a) == 4:
+                    _, nm, col, fn = a
+                    _named[nm] = (col, fn)
+                elif kind == "size" and len(a) == 2:
+                    _, nm = a
+                    _sizes.append(nm)
+                elif kind == "raw" and len(a) == 3:
+                    _, nm, expr = a
+                    _raw.append((nm, expr))
+
+            if _raw:
+                add(f"# NOTE: Some aggregations not recognized: {_raw!r}")
+
+            gb = f"{src}.groupby({keys!r}, dropna=False)"
+
+            if _named and not _sizes:
+                add(f"{lhs} = {gb}.agg(**{_named!r}).reset_index()")
+            elif _sizes and not _named:
+                nm = _sizes[0]
+                add(f"{lhs} = {gb}.size().rename('{nm}').reset_index()")
+                for extra in _sizes[1:]:
+                    add(f"{lhs}['{extra}'] = {lhs}['{nm}']")
+            else:
+                # both present: merge size into named-agg result
+                add(f"_agg_df = {gb}.agg(**{_named!r}).reset_index()")
+                nm = _sizes[0] if _sizes else None
+                if nm:
+                    add(f"_size_df = {gb}.size().rename('{nm}').reset_index()")
+                    add(f"{lhs} = pd.merge(_agg_df, _size_df, on={keys!r}, how='left')")
+                    for extra in _sizes[1:]:
+                        add(f"{lhs}['{extra}'] = {lhs}['{nm}']")
+                else:
+                    add(f"{lhs} = _agg_df")
+            env[lhs_raw] = lhs; last_df = lhs; continue
+
         # --- Fallback --------------------------------------------------------
         unsupported(lhs_raw, rhs)
 
