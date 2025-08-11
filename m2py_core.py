@@ -478,35 +478,56 @@ def convert_m_to_python(m_code: str, query_name: str = "Result") -> str:
             env[lhs_raw] = lhs; last_df = lhs; continue
 
         # --- Table.Group -----------------------------------------------------
-        # Table.Group(Source, {"A"}, {{"Sum", each List.Sum([Val]), type number}, {"Count", each Table.RowCount(_), Int64.Type}})
+        # Examples:
+        #   Table.Group(Source, {"A"}, {{"Sum",   each List.Sum([Val]),   type number}})
+        #   Table.Group(Source, {"A"}, {{"Avg",   each List.Average([V]), type number}})
+        #   Table.Group(Source, {"A"}, {{"Min",   each List.Min([V]),     type number}})
+        #   Table.Group(Source, {"A"}, {{"Max",   each List.Max([V]),     type number}})
+        #   Table.Group(Source, {"A"}, {{"Med",   each List.Median([V]),  type number}})
+        #   Table.Group(Source, {"A"}, {{"Std",   each List.StandardDeviation([V]), type number}})
+        #   Table.Group(Source, {"A"}, {{"Var",   each List.Variance([V]), type number}})
+        #   Table.Group(Source, {"A"}, {{"Prod",  each List.Product([V]), type number}})
+        #   Table.Group(Source, {"A"}, {{"First", each List.First([V]),   type any}})
+        #   Table.Group(Source, {"A"}, {{"Last",  each List.Last([V]),    type any}})
+        #   Table.Group(Source, {"A"}, {{"Cnt",   each List.Count([V]),   Int64.Type}})
+        #   Table.Group(Source, {"A"}, {{"Rows",  each Table.RowCount(_), Int64.Type}})
         m = re.search(r'Table\.Group\(\s*([^,]+)\s*,\s*\{([^\}]*)\}\s*,\s*\{(.+)\}\s*\)\s*$', rhs, flags=re.S)
         if m:
             src = _normalize_var(m.group(1).strip())
             keys = re.findall(r'"([^"]+)"', m.group(2))
             spec = m.group(3)
 
-            # Parse aggregations: {"New", each <expr>, ...}
+            # Parse aggregations: {"NewName", each <expr>, ...}
             aggs = []
             for nm, expr in re.findall(r'\{\s*"([^"]+)"\s*,\s*each\s+(.+?)\s*(?:,\s*[^}]*)?\}', spec, flags=re.S):
                 expr = expr.strip()
                 # List.* over [Col]
-                m_sum = re.match(r'List\.Sum\(\s*\[([^\]]+)\]\s*\)', expr)
-                m_avg = re.match(r'List\.Average\(\s*\[([^\]]+)\]\s*\)', expr)
-                m_min = re.match(r'List\.Min\(\s*\[([^\]]+)\]\s*\)', expr)
-                m_max = re.match(r'List\.Max\(\s*\[([^\]]+)\]\s*\)', expr)
-                m_cnt = re.match(r'Table\.RowCount\(\s*_\s*\)', expr)
-                if m_sum:
-                    aggs.append(("named", nm, m_sum.group(1), "sum"))
-                elif m_avg:
-                    aggs.append(("named", nm, m_avg.group(1), "mean"))
-                elif m_min:
-                    aggs.append(("named", nm, m_min.group(1), "min"))
-                elif m_max:
-                    aggs.append(("named", nm, m_max.group(1), "max"))
-                elif m_cnt:
-                    aggs.append(("size", nm))
-                else:
-                    aggs.append(("raw", nm, expr))  # fallback/unknown
+                m_sum    = re.match(r'List\.Sum\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_avg    = re.match(r'List\.Average\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_min    = re.match(r'List\.Min\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_max    = re.match(r'List\.Max\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_med    = re.match(r'List\.Median\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_std    = re.match(r'List\.StandardDeviation\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_var    = re.match(r'List\.Variance\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_prod   = re.match(r'List\.Product\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_first  = re.match(r'List\.First\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_last   = re.match(r'List\.Last\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_count  = re.match(r'List\.Count\(\s*\[([^\]]+)\]\s*\)$', expr)
+                m_cnttbl = re.match(r'Table\.RowCount\(\s*_\s*\)$', expr)
+
+                if m_sum:      aggs.append(("named", nm, m_sum.group(1), "sum"))
+                elif m_avg:    aggs.append(("named", nm, m_avg.group(1), "mean"))
+                elif m_min:    aggs.append(("named", nm, m_min.group(1), "min"))
+                elif m_max:    aggs.append(("named", nm, m_max.group(1), "max"))
+                elif m_med:    aggs.append(("named", nm, m_med.group(1), "median"))
+                elif m_std:    aggs.append(("named", nm, m_std.group(1), "std"))
+                elif m_var:    aggs.append(("named", nm, m_var.group(1), "var"))
+                elif m_prod:   aggs.append(("named", nm, m_prod.group(1), "prod"))
+                elif m_first:  aggs.append(("named", nm, m_first.group(1), "first"))
+                elif m_last:   aggs.append(("named", nm, m_last.group(1), "last"))
+                elif m_count:  aggs.append(("size", nm))  # count rows per group
+                elif m_cnttbl: aggs.append(("size", nm))
+                else:          aggs.append(("raw", nm, expr))  # fallback/unknown
 
             # Build pandas operations (safe unpacking)
             _named, _sizes, _raw = {}, [], []
@@ -537,7 +558,6 @@ def convert_m_to_python(m_code: str, query_name: str = "Result") -> str:
                 for extra in _sizes[1:]:
                     add(f"{lhs}['{extra}'] = {lhs}['{nm}']")
             else:
-                # both present: merge size into named-agg result
                 add(f"_agg_df = {gb}.agg(**{_named!r}).reset_index()")
                 nm = _sizes[0] if _sizes else None
                 if nm:
