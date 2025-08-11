@@ -386,7 +386,50 @@ def convert_m_to_python(m_code: str, query_name: str | None = None) -> str:
             add(f"{lhs}.columns = [c if not isinstance(c, tuple) else c[-1] for c in {lhs}.columns]")
             env[lhs_raw] = lhs; last_df = lhs; continue
 
-        # --- Fallback --------------------------------------------------------
+        
+        # --- ExpandRecordColumn ----------------------------------------------
+        m = re.search(r'Table\.ExpandRecordColumn\(\s*([^,]+),\s*"([^"]+)"\s*,\s*\{([^\}]*)\}\s*,\s*\{([^\}]*)\}\s*\)', rhs)
+        if m:
+            src = _normalize_var(m.group(1).strip())
+            col = m.group(2)
+            fields_raw = m.group(3)
+            newnames_raw = m.group(4)
+            fields = [s for s in re.findall(r'"([^"]+)"', fields_raw)]
+            newnames = [s for s in re.findall(r'"([^"]+)"', newnames_raw)]
+            if not newnames or len(newnames) != len(fields):
+                newnames = fields[:]
+            add(f"{lhs} = {src}.drop(columns=['{col}'], errors='ignore').copy()")
+            add(f"_exp = {src}['{col}'].apply(lambda x: pd.Series(x) if isinstance(x, dict) else pd.Series(dtype='object'))")
+            if fields:
+                add(f"_exp = _exp[{fields!r}]")
+            if newnames and fields:
+                add(f"_exp = _exp.rename(columns={{**dict(zip({fields!r}, {newnames!r}))}})")
+            add(f"{lhs} = {lhs}.join(_exp)")
+            env[lhs_raw] = lhs; last_df = lhs; continue
+
+        # --- ExpandTableColumn -----------------------------------------------
+        m = re.search(r'Table\.ExpandTableColumn\(\s*([^,]+),\s*"([^"]+)"\s*,\s*\{([^\}]*)\}\s*,\s*\{([^\}]*)\}\s*\)', rhs)
+        if m:
+            src = _normalize_var(m.group(1).strip())
+            col = m.group(2)
+            fields_raw = m.group(3)
+            newnames_raw = m.group(4)
+            fields = [s for s in re.findall(r'"([^"]+)"', fields_raw)]
+            newnames = [s for s in re.findall(r'"([^"]+)"', newnames_raw)]
+            if not newnames or len(newnames) != len(fields):
+                newnames = fields[:]
+            add(f"{lhs} = {src}.copy()")
+            add(f"_tbl = {lhs}.pop('{col}') if '{col}' in {lhs}.columns else pd.Series(index={lhs}.index, dtype='object')")
+            add(f"_tbl = _tbl.apply(lambda t: t if isinstance(t, (list, tuple)) else ([] if t is None else [t]))")
+            add(f"_tbl = _tbl.explode()")
+            add(f"_df = pd.DataFrame(_tbl.tolist()) if not _tbl.empty else pd.DataFrame(columns={fields!r})")
+            if fields:
+                add(f"_df = _df.reindex(columns={fields!r})")
+            if newnames and fields:
+                add(f"_df = _df.rename(columns={{**dict(zip({fields!r}, {newnames!r}))}})")
+            add(f"{lhs} = {lhs}.join(_df.reset_index(drop=True))")
+            env[lhs_raw] = lhs; last_df = lhs; continue
+# --- Fallback --------------------------------------------------------
         add(f"# Unsupported: {lhs_raw} = {rhs}")
 
     # Append final alias if we know the query name and can find the final symbol
