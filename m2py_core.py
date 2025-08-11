@@ -94,13 +94,15 @@ def convert_m_to_python(m_code: str, query_name: str = "Result") -> str:
         "",
     ]
 
-    # Find LET ... IN
-    let_match = re.search(r"\blet\b(.*)\bin\b\s*([#\"A-Za-z0-9_\.]+)\s*$", m_code, flags=re.S | re.I)
+    # Find LET ... IN  (allow quoted names with spaces, e.g. #"Changed Type")
+    let_match = re.search(
+        r"\blet\b(.*)\bin\b\s*((?:#\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_\.]*))\s*$",
+        m_code, flags=re.S | re.I
+    )
     if let_match:
         let_body = let_match.group(1)
         out_name_raw = let_match.group(2)
     else:
-        # Treat whole string as a single assignment if there's '='
         let_body = m_code.strip()
         out_name_raw = query_name
 
@@ -567,6 +569,67 @@ def convert_m_to_python(m_code: str, query_name: str = "Result") -> str:
                         add(f"{lhs}['{extra}'] = {lhs}['{nm}']")
                 else:
                     add(f"{lhs} = _agg_df")
+            env[lhs_raw] = lhs; last_df = lhs; continue
+
+        # --- Table.FromRows (Json.Document(Binary.Decompress(Binary.FromText(...)))) ---
+        # Typical PQ sample payload compressed as base64+deflate
+        m = re.search(
+            r'Table\.FromRows\(\s*Json\.Document\(\s*Binary\.Decompress\(\s*Binary\.FromText\("([^"]+)"\s*,\s*BinaryEncoding\.Base64\)\s*,\s*Compression\.Deflate\)\s*\)\s*,\s*.*?type\s+table\s*\[([^\]]+)\]\s*\)\s*$',
+            rhs, flags=re.S
+        )
+        if m:
+            b64 = m.group(1)
+            cols_spec = m.group(2)
+
+            # Parse column names from 'type table [Key = _t, Value = _t]'
+            cols = []
+            for part in re.split(r',', cols_spec):
+                k = part.split('=', 1)[0].strip()
+                if k.startswith('#"') and k.endswith('"'):
+                    k = k[2:-1]
+                k = k.strip('"')
+                cols.append(k)
+
+            # Try to decode now (during conversion) to emit a readable literal
+            rows = None
+            try:
+                import base64, zlib, json  # local import to avoid top-level dependency if unused
+                _bin = base64.b64decode(b64)
+                try:
+                    _json_bytes = zlib.decompress(_bin)
+                except Exception:
+                    _json_bytes = zlib.decompress(_bin, -15)  # raw DEFLATE fallback
+                rows = json.loads(_json_bytes.decode('utf-8'))
+            except Exception:
+                rows = None  # fall back to runtime decode
+
+            def _emit_runtime_decode():
+                add("import base64, zlib, json")
+                add(f"_bin = base64.b64decode('{b64}')")
+                add("try:\n    _json_bytes = zlib.decompress(_bin)\nexcept Exception:\n    _json_bytes = zlib.decompress(_bin, -15)")
+                add("_rows = json.loads(_json_bytes.decode('utf-8'))")
+                add(f"{lhs} = pd.DataFrame(_rows, columns={cols!r})")
+
+            if isinstance(rows, list):
+                # Normalize to list-of-dicts for readability
+                if rows and isinstance(rows[0], dict):
+                    dict_rows = [{c: r.get(c) for c in cols} for r in rows]
+                else:
+                    dict_rows = [{cols[i]: (r[i] if i < len(r) else None) for i in range(len(cols))}
+                                 for r in rows]
+
+                # Heuristic: inline if not too large
+                payload_chars = sum(len(repr(v)) for d in dict_rows for v in d.values() if v is not None)
+                if len(dict_rows) <= 200 and payload_chars <= 8000:
+                    add(f"{lhs} = pd.DataFrame([")
+                    for d in dict_rows:
+                        add(f"    {d!r},")
+                    add(f"], columns={cols!r})")
+                else:
+                    _emit_runtime_decode()
+            else:
+                _emit_runtime_decode()
+
             env[lhs_raw] = lhs; last_df = lhs; continue
 
         # --- Fallback --------------------------------------------------------
