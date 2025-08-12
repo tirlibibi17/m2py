@@ -181,6 +181,8 @@ PRs with:
 
 …are very welcome.
 
+Feel free to contact me on Reddit: u/tirlibibi17
+
 ---
 
 ## License
