@@ -244,26 +244,59 @@ with tab2:
                 for nm in pat.findall(m_text):
                     names_needed.add(nm)
 
-            # Try to materialize __cw with real DataFrames from the workbook
-            cw_code = "import pandas as pd\n__cw = {}\n\n"
+            # --------------------------
+            # Build __cw preamble ONLY if needed
+            # --------------------------
+            cw_code = ""  # default: no preamble if no CurrentWorkbook usage
             tables_debug = {}
-            if names_needed and st.session_state.get("excel_tmp_path") and _COM_AVAILABLE:
-                try:
-                    tables = extract_currentworkbook_tables_via_com(
-                        st.session_state["excel_tmp_path"], sorted(names_needed)
-                    ) or {}
-                    # Build a readable __cw literal; emit ALL names (even if empty)
-                    lines = ["import pandas as pd", "__cw = {}"]
-                    for nm in sorted(names_needed):
-                        rows = tables.get(nm) or []
-                        tables_debug[nm] = len(rows)
-                        lines.append(f"__cw['{nm}'] = pd.DataFrame({rows!r})")
-                    cw_code = "\n".join(lines) + "\n\n"
-                except Exception as e:
-                    st.warning("Could not materialize __cw from workbook; falling back to empty dict.")
-                    st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)), language="text")
+            tmpl_names = sorted(names_needed) if names_needed else []
 
-            # Optional: show what we found
+            if names_needed:
+                lines = ["import pandas as pd", "__cw = {}"]
+
+                # Try to materialize via COM (if available)
+                if st.session_state.get("excel_tmp_path") and _COM_AVAILABLE:
+                    try:
+                        tables = extract_currentworkbook_tables_via_com(
+                            st.session_state["excel_tmp_path"], sorted(names_needed)
+                        ) or {}
+                        for nm in sorted(names_needed):
+                            rows = tables.get(nm) or []
+                            tables_debug[nm] = len(rows)
+                            lines.append(f"__cw['{nm}'] = pd.DataFrame({rows!r})")
+                    except Exception as e:
+                        st.warning("Could not materialize __cw from workbook; falling back to empty dict.")
+                        st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)), language="text")
+
+                # Always append a commented external-Excel template (only when names_needed)
+                lines += [
+                    "",
+                    "# --- Optional: load CurrentWorkbook tables from an external Excel file ---",
+                    "# EXCEL_PATH = r'C:\\path\\to\\workbook.xlsx'  # <- set this to your file",
+                    "# from openpyxl import load_workbook",
+                    "# from openpyxl.utils import range_boundaries",
+                    "# wb = load_workbook(EXCEL_PATH, data_only=True)",
+                    "# ",
+                    "# def _table_df(wb, table_name):",
+                    "#     for ws in wb.worksheets:",
+                    "#         for t in getattr(ws, '_tables', {}).values():  # openpyxl Tables",
+                    "#             if t.name == table_name:",
+                    "#                 min_col, min_row, max_col, max_row = range_boundaries(t.ref)",
+                    "#                 data = list(ws.iter_rows(min_row=min_row, max_row=max_row,",
+                    "#                                       min_col=min_col, max_col=max_col, values_only=True))",
+                    "#                 if not data:",
+                    "#                     return pd.DataFrame()",
+                    "#                 df = pd.DataFrame(data[1:], columns=data[0])  # first row = headers",
+                    "#                 return df",
+                    "#     return pd.DataFrame()",
+                ]
+                for nm in (tmpl_names or ["Table1"]):
+                    lines.append(f"# __cw['{nm}'] = _table_df(wb, '{nm}')  # uncomment to load from EXCEL_PATH")
+                lines += ["# # wb.close()  # optional: close workbook when done", ""]
+
+                cw_code = "\n".join(lines) + "\n\n"
+
+            # Optional: show what COM returned (only when relevant)
             if tables_debug:
                 st.caption(
                     "CurrentWorkbook items (rows): " +
