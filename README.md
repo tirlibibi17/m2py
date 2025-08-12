@@ -181,7 +181,7 @@ PRs with:
 
 …are very welcome.
 
-Feel free to contact me on Reddit: u/tirlibibi17
+Feel free to contact me on Reddit: [u/tirlibibi17](https://www.reddit.com/user/tirlibibi17)
 
 ---
 
