@@ -626,6 +626,20 @@ def convert_m_to_python(m_code: str, query_name: str = "Result") -> str:
             last_df = lhs
             continue
 
+        # --- Direct query/reference binding:  #"Other Query"  or  Other_Query
+        # If RHS is just a query/step name, copy that DataFrame.
+        m = re.match(r'^(#\"([^\"]+)\"|[A-Za-z_][A-Za-z0-9_\.]*)$', rhs)
+        if m:
+            # Extract the raw reference name (strip #"...")
+            ref_raw = m.group(2) if m.group(2) is not None else m.group(1)
+            # Prefer a step defined earlier in *this* query; otherwise fall back to the
+            # normalized global name (which matches the variable produced in prior blocks).
+            ref_py = env.get(ref_raw, _normalize_var(ref_raw))
+            add(f"{lhs} = {ref_py}.copy()")
+            env[lhs_raw] = lhs
+            last_df = lhs
+            continue
+
         # --- Fallback --------------------------------------------------------
         unsupported(lhs_raw, rhs)
 

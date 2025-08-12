@@ -12,14 +12,14 @@ Features:
 
 from __future__ import annotations
 
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set
 import re
-from collections import defaultdict, deque
+from collections import deque
 
 
 def _normalize_query_name(name: str) -> str:
     """Keep the original name, but normalize how we compare."""
-    return name.strip()
+    return (name or "").strip()
 
 
 def find_query_refs(m_text: str, known_names: Set[str]) -> Set[str]:
@@ -29,42 +29,47 @@ def find_query_refs(m_text: str, known_names: Set[str]) -> Set[str]:
     We consider:
       - #"Some Query"
       - Bare identifiers that are an exact name of another query (after basic cleaning)
+
+    NOTE: Do NOT try to remove self-references here; we filter them later when
+    constructing the dependency edges (we know the current query name there).
     """
     refs: Set[str] = set()
     text = m_text or ""
 
-    # 1) Explicit #"Name" references
-    for m in re.finditer(r'#"([^"]+)"', text):
-        refs.add(_normalize_query_name(m.group(1)))
+    # 1) Explicit #"Name" references (quoted names with spaces etc.)
+    for m in re.finditer(r'#"\s*([^"]+?)\s*"', text):
+        nm = _normalize_query_name(m.group(1))
+        if nm in known_names:
+            refs.add(nm)
 
     # 2) Bare identifiers: tokens that match a known query name exactly.
-    #    We only look for tokens that look like identifiers and then match known names.
-    #    (Keeps false positives low.)
+    #    This is conservative to avoid false positives.
     tokens = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_\.]*\b', text))
     for t in tokens:
         if t in known_names:
             refs.add(t)
 
-    # A query does not depend on itself
-    return refs - {t for t in known_names if t in refs and len(refs) == 1 and next(iter(refs)) == t}
+    return refs
 
 
 def topo_order_queries(queries: Dict[str, str]) -> List[str]:
     """
-    Return a global topological order for all queries in the workbook.
-    Independent components are ordered deterministically (by name).
+    Return a global, deterministic topological order for all queries.
+    Independent components are ordered by name.
     """
-    names = set(queries.keys())
-    edges: Dict[str, Set[str]] = {n: set() for n in names}   # n -> deps
-    rev: Dict[str, Set[str]] = {n: set() for n in names}     # dep -> users
+    names = {_normalize_query_name(n) for n in queries.keys()}
+    edges = {n: set() for n in names}   # n -> deps
+    rev   = {n: set() for n in names}   # dep -> users
 
     for name, text in queries.items():
+        n = _normalize_query_name(name)
         deps = find_query_refs(text, names)
-        edges[name] = set(d for d in deps if d in names and d != name)
-        for d in edges[name]:
-            rev[d].add(name)
+        # filter out self-edges here
+        edges[n] = {d for d in deps if d in names and d != n}
+        for d in edges[n]:
+            rev[d].add(n)
 
-    # Kahn's algorithm
+    # Kahn's algorithm with deterministic queue
     indeg = {n: 0 for n in names}
     for n in names:
         for d in edges[n]:
@@ -75,18 +80,16 @@ def topo_order_queries(queries: Dict[str, str]) -> List[str]:
     while q:
         n = q.popleft()
         order.append(n)
-        for user in rev[n]:
+        for user in sorted(rev[n]):  # sort for stability
             indeg[user] -= 1
             if indeg[user] == 0:
                 q.append(user)
-        # keep deterministic
-        q = deque(sorted(q))
 
-    # If there was a cycle, fall back to a stable name order with a warning order
+    # If a cycle exists, append remaining nodes deterministically
     if len(order) != len(names):
-        # put any remaining nodes deterministically at the end
-        remaining = sorted(n for n in names if n not in order)
-        order.extend(remaining)
+        for n in sorted(names):
+            if n not in order:
+                order.append(n)
 
     return order
 
@@ -95,27 +98,30 @@ def dependency_chain_for(target: str, queries: Dict[str, str]) -> List[str]:
     """
     Return the dependency chain for 'target': all transitive deps (in topo order) + target at the end.
     """
-    if target not in queries:
+    target_n = _normalize_query_name(target)
+    names = {_normalize_query_name(n) for n in queries.keys()}
+    if target_n not in names:
         return [target]  # let caller handle "missing" gracefully
 
-    names = set(queries.keys())
-
     # Build graph (name -> deps), and reverse graph
-    edges: Dict[str, Set[str]] = {n: set() for n in names}
-    rev: Dict[str, Set[str]] = {n: set() for n in names}
+    edges = {n: set() for n in names}
+    rev   = {n: set() for n in names}
 
-    for name, text in queries.items():
-        deps = find_query_refs(text, names)
-        edges[name] = set(d for d in deps if d in names and d != name)
-        for d in edges[name]:
-            rev[d].add(name)
+    # Map normalized name -> original text
+    text_by_norm = { _normalize_query_name(n): (queries.get(n) or "") for n in queries }
+
+    for n in names:
+        deps = find_query_refs(text_by_norm[n], names)
+        edges[n] = {d for d in deps if d in names and d != n}
+        for d in edges[n]:
+            rev[d].add(n)
 
     # Global order to keep output stable
     order = topo_order_queries(queries)
 
     # DFS from target back through deps to collect the reachable subgraph
     seen: Set[str] = set()
-    stack = [target]
+    stack = [target_n]
     while stack:
         cur = stack.pop()
         if cur in seen:
@@ -124,6 +130,6 @@ def dependency_chain_for(target: str, queries: Dict[str, str]) -> List[str]:
         stack.extend(edges[cur])
 
     # Keep only reachable nodes in the global topo order, ensure target is last
-    chain = [n for n in order if n in seen and n != target]
-    chain.append(target)
+    chain = [n for n in order if n in seen and n != target_n]
+    chain.append(target_n)
     return chain
